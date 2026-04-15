@@ -10,8 +10,8 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 function serializeDecimal(obj) {
   const out = { ...obj };
-  if (out.amount) out.amount = out.amount.toNumber();
-  if (out.balance) out.balance = out.balance.toNumber();
+  if (out.amount) out.amount = out.amount;
+  if (out.balance) out.balance = out.balance;
   return out;
 }
 
@@ -46,7 +46,7 @@ async function fetchUserFinancialData(userId) {
     accounts: accounts.map(serializeDecimal),
     currentMonthTx: currentMonthTx.map(serializeDecimal),
     historicalTx: historicalTx.map(serializeDecimal),
-    budget: budget ? { ...budget, amount: budget.amount.toNumber() } : null,
+    budget: budget ? { ...budget, amount: budget.amount } : null,
     now,
     startOfMonth,
     endOfMonth,
