@@ -1,11 +1,12 @@
 "use server";
 
 import { auth } from "@clerk/nextjs/server";
-import { db } from "@/lib/prisma";
+import { db } from "@/lib/db";
 import { revalidatePath } from "next/cache";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import aj from "@/lib/arcjet";
 import { request } from "@arcjet/next";
+import crypto from "crypto";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -14,81 +15,51 @@ const serializeAmount = (obj) => ({
   amount: obj.amount,
 });
 
-// Create Transaction
 export async function createTransaction(data) {
   try {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    // Get request data for ArcJet
     const req = await request();
-
-    // Check rate limit
-    const decision = await aj.protect(req, {
-      userId,
-      requested: 1, // Specify how many tokens to consume
-    });
+    const decision = await aj.protect(req, { userId, requested: 1 });
 
     if (decision.isDenied()) {
       if (decision.reason.isRateLimit()) {
         const { remaining, reset } = decision.reason;
-        console.error({
-          code: "RATE_LIMIT_EXCEEDED",
-          details: {
-            remaining,
-            resetInSeconds: reset,
-          },
-        });
-
+        console.error({ code: "RATE_LIMIT_EXCEEDED", details: { remaining, resetInSeconds: reset } });
         throw new Error("Too many requests. Please try again later.");
       }
-
       throw new Error("Request blocked");
     }
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const user = db.prepare('SELECT * FROM users WHERE clerkUserId = ?').get(userId);
+    if (!user) throw new Error("User not found");
 
-    if (!user) {
-      throw new Error("User not found");
-    }
+    const account = db.prepare('SELECT * FROM accounts WHERE id = ? AND userId = ?').get(data.accountId, user.id);
+    if (!account) throw new Error("Account not found");
 
-    const account = await db.account.findUnique({
-      where: {
-        id: data.accountId,
-        userId: user.id,
-      },
-    });
-
-    if (!account) {
-      throw new Error("Account not found");
-    }
-
-    // Calculate new balance
     const balanceChange = data.type === "EXPENSE" ? -data.amount : data.amount;
-    const newBalance = account.balance + balanceChange;
 
-    // Create transaction and update account balance
-    const transaction = await db.$transaction(async (tx) => {
-      const newTransaction = await tx.transaction.create({
-        data: {
-          ...data,
-          userId: user.id,
-          nextRecurringDate:
-            data.isRecurring && data.recurringInterval
-              ? calculateNextRecurringDate(data.date, data.recurringInterval)
-              : null,
-        },
-      });
+    const createTx = db.transaction(() => {
+      const newTransactionId = crypto.randomUUID();
+      const nextDate = data.isRecurring && data.recurringInterval
+        ? calculateNextRecurringDate(data.date, data.recurringInterval).toISOString()
+        : null;
+      
+      const now = new Date().toISOString();
+      const dateStr = new Date(data.date).toISOString();
 
-      await tx.account.update({
-        where: { id: data.accountId },
-        data: { balance: newBalance },
-      });
+      db.prepare(`
+        INSERT INTO transactions (id, type, amount, description, date, category, status, isRecurring, recurringInterval, nextRecurringDate, userId, accountId, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(newTransactionId, data.type, data.amount, data.description, dateStr, data.category, "COMPLETED", data.isRecurring ? 1 : 0, data.recurringInterval, nextDate, user.id, data.accountId, now, now);
 
-      return newTransaction;
+      db.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ?').run(balanceChange, data.accountId);
+      
+      return db.prepare('SELECT * FROM transactions WHERE id = ?').get(newTransactionId);
     });
+
+    const transaction = createTx();
 
     revalidatePath("/dashboard");
     revalidatePath(`/account/${transaction.accountId}`);
@@ -103,19 +74,10 @@ export async function getTransaction(id) {
   const { userId } = await auth();
   if (!userId) throw new Error("Unauthorized");
 
-  const user = await db.user.findUnique({
-    where: { clerkUserId: userId },
-  });
-
+  const user = db.prepare('SELECT * FROM users WHERE clerkUserId = ?').get(userId);
   if (!user) throw new Error("User not found");
 
-  const transaction = await db.transaction.findUnique({
-    where: {
-      id,
-      userId: user.id,
-    },
-  });
-
+  const transaction = db.prepare('SELECT * FROM transactions WHERE id = ? AND userId = ?').get(id, user.id);
   if (!transaction) throw new Error("Transaction not found");
 
   return serializeAmount(transaction);
@@ -126,64 +88,36 @@ export async function updateTransaction(id, data) {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
-
+    const user = db.prepare('SELECT * FROM users WHERE clerkUserId = ?').get(userId);
     if (!user) throw new Error("User not found");
 
-    // Get original transaction to calculate balance change
-    const originalTransaction = await db.transaction.findUnique({
-      where: {
-        id,
-        userId: user.id,
-      },
-      include: {
-        account: true,
-      },
-    });
-
+    const originalTransaction = db.prepare('SELECT * FROM transactions WHERE id = ? AND userId = ?').get(id, user.id);
     if (!originalTransaction) throw new Error("Transaction not found");
 
-    // Calculate balance changes
-    const oldBalanceChange =
-      originalTransaction.type === "EXPENSE"
-        ? -originalTransaction.amount
-        : originalTransaction.amount;
-
-    const newBalanceChange =
-      data.type === "EXPENSE" ? -data.amount : data.amount;
-
+    const oldBalanceChange = originalTransaction.type === "EXPENSE" ? -originalTransaction.amount : originalTransaction.amount;
+    const newBalanceChange = data.type === "EXPENSE" ? -data.amount : data.amount;
     const netBalanceChange = newBalanceChange - oldBalanceChange;
 
-    // Update transaction and account balance in a transaction
-    const transaction = await db.$transaction(async (tx) => {
-      const updated = await tx.transaction.update({
-        where: {
-          id,
-          userId: user.id,
-        },
-        data: {
-          ...data,
-          nextRecurringDate:
-            data.isRecurring && data.recurringInterval
-              ? calculateNextRecurringDate(data.date, data.recurringInterval)
-              : null,
-        },
-      });
+    const updateTx = db.transaction(() => {
+      const nextDate = data.isRecurring && data.recurringInterval
+        ? calculateNextRecurringDate(data.date, data.recurringInterval).toISOString()
+        : null;
+      
+      const now = new Date().toISOString();
+      const dateStr = new Date(data.date).toISOString();
 
-      // Update account balance
-      await tx.account.update({
-        where: { id: data.accountId },
-        data: {
-          balance: {
-            increment: netBalanceChange,
-          },
-        },
-      });
+      db.prepare(`
+        UPDATE transactions 
+        SET type = ?, amount = ?, description = ?, date = ?, category = ?, isRecurring = ?, recurringInterval = ?, nextRecurringDate = ?, accountId = ?, updatedAt = ?
+        WHERE id = ? AND userId = ?
+      `).run(data.type, data.amount, data.description, dateStr, data.category, data.isRecurring ? 1 : 0, data.recurringInterval, nextDate, data.accountId, now, id, user.id);
 
-      return updated;
+      db.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ?').run(netBalanceChange, data.accountId);
+
+      return db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
     });
+
+    const transaction = updateTx();
 
     revalidatePath("/dashboard");
     revalidatePath(`/account/${data.accountId}`);
@@ -194,31 +128,40 @@ export async function updateTransaction(id, data) {
   }
 }
 
-// Get User Transactions
 export async function getUserTransactions(query = {}) {
   try {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const user = db.prepare('SELECT * FROM users WHERE clerkUserId = ?').get(userId);
+    if (!user) throw new Error("User not found");
 
-    if (!user) {
-      throw new Error("User not found");
+    let sql = 'SELECT t.*, a.name as accountName, a.type as accountType, a.balance as accountBalance, a.isDefault as accountIsDefault FROM transactions t LEFT JOIN accounts a ON t.accountId = a.id WHERE t.userId = ?';
+    const params = [user.id];
+
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && typeof value !== 'object') {
+        sql += ` AND t.${key} = ?`;
+        params.push(value);
+      }
     }
 
-    const transactions = await db.transaction.findMany({
-      where: {
-        userId: user.id,
-        ...query,
-      },
-      include: {
-        account: true,
-      },
-      orderBy: {
-        date: "desc",
-      },
+    sql += ' ORDER BY t.date DESC';
+
+    const rawTx = db.prepare(sql).all(...params);
+
+    const transactions = rawTx.map(t => {
+      const { accountName, accountType, accountBalance, accountIsDefault, ...rest } = t;
+      return {
+        ...rest,
+        account: {
+          id: t.accountId,
+          name: accountName,
+          type: accountType,
+          balance: accountBalance,
+          isDefault: Boolean(accountIsDefault)
+        }
+      };
     });
 
     return { success: true, data: transactions };

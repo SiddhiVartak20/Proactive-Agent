@@ -1,7 +1,8 @@
 "use server";
 
-import { db } from "@/lib/prisma";
+import { db } from "@/lib/db";
 import { subDays } from "date-fns";
+import crypto from "crypto";
 
 const ACCOUNT_ID = "account-id";
 const USER_ID = "user-id";
@@ -65,13 +66,13 @@ export async function seedTransactions() {
           description: `${
             type === "INCOME" ? "Received" : "Paid for"
           } ${category}`,
-          date,
+          date: date.toISOString(),
           category,
           status: "COMPLETED",
           userId: USER_ID,
           accountId: ACCOUNT_ID,
-          createdAt: date,
-          updatedAt: date,
+          createdAt: date.toISOString(),
+          updatedAt: date.toISOString(),
         };
 
         totalBalance += type === "INCOME" ? amount : -amount;
@@ -80,23 +81,24 @@ export async function seedTransactions() {
     }
 
     // Insert transactions in batches and update account balance
-    await db.$transaction(async (tx) => {
+    const seedTransaction = db.transaction((txs) => {
       // Clear existing transactions
-      await tx.transaction.deleteMany({
-        where: { accountId: ACCOUNT_ID },
-      });
+      db.prepare('DELETE FROM transactions WHERE accountId = ?').run(ACCOUNT_ID);
 
       // Insert new transactions
-      await tx.transaction.createMany({
-        data: transactions,
-      });
+      const insert = db.prepare(`
+        INSERT INTO transactions (id, type, amount, description, date, category, status, userId, accountId, createdAt, updatedAt)
+        VALUES (@id, @type, @amount, @description, @date, @category, @status, @userId, @accountId, @createdAt, @updatedAt)
+      `);
+      for (const t of txs) {
+        insert.run(t);
+      }
 
       // Update account balance
-      await tx.account.update({
-        where: { id: ACCOUNT_ID },
-        data: { balance: totalBalance },
-      });
+      db.prepare('UPDATE accounts SET balance = ? WHERE id = ?').run(totalBalance, ACCOUNT_ID);
     });
+
+    seedTransaction(transactions);
 
     return {
       success: true,

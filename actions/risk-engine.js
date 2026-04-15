@@ -1,7 +1,7 @@
 "use server";
 
 import { auth } from "@clerk/nextjs/server";
-import { db } from "@/lib/prisma";
+import { db } from "@/lib/db";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -29,18 +29,21 @@ async function fetchUserFinancialData(userId) {
   // Last 3 months for pattern analysis
   const threeMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 3, 1);
 
-  const [accounts, currentMonthTx, historicalTx, budget] = await Promise.all([
-    db.account.findMany({ where: { userId } }),
-    db.transaction.findMany({
-      where: { userId, date: { gte: startOfMonth, lte: endOfMonth } },
-      orderBy: { date: "asc" },
-    }),
-    db.transaction.findMany({
-      where: { userId, date: { gte: threeMonthsAgo, lt: startOfMonth } },
-      orderBy: { date: "asc" },
-    }),
-    db.budget.findFirst({ where: { userId } }),
-  ]);
+  const accounts = db.prepare('SELECT * FROM accounts WHERE userId = ?').all(userId);
+  
+  const currentMonthTx = db.prepare(`
+    SELECT * FROM transactions 
+    WHERE userId = ? AND date >= ? AND date <= ? 
+    ORDER BY date ASC
+  `).all(userId, startOfMonth.toISOString(), endOfMonth.toISOString());
+  
+  const historicalTx = db.prepare(`
+    SELECT * FROM transactions 
+    WHERE userId = ? AND date >= ? AND date < ? 
+    ORDER BY date ASC
+  `).all(userId, threeMonthsAgo.toISOString(), startOfMonth.toISOString());
+  
+  const budget = db.prepare('SELECT * FROM budgets WHERE userId = ?').get(userId);
 
   return {
     accounts: accounts.map(serializeDecimal),
@@ -222,9 +225,7 @@ export async function getRiskAnalysis() {
     const { userId: clerkUserId } = await auth();
     if (!clerkUserId) throw new Error("Unauthorized");
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId },
-    });
+    const user = db.prepare('SELECT * FROM users WHERE clerkUserId = ?').get(clerkUserId);
     if (!user) throw new Error("User not found");
 
     const data = await fetchUserFinancialData(user.id);
