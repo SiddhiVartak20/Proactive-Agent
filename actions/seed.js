@@ -1,8 +1,7 @@
 "use server";
 
-import { db } from "@/lib/db";
+import { db } from "@/lib/prisma";
 import { subDays } from "date-fns";
-import crypto from "crypto";
 
 const ACCOUNT_ID = "account-id";
 const USER_ID = "user-id";
@@ -63,16 +62,15 @@ export async function seedTransactions() {
           id: crypto.randomUUID(),
           type,
           amount,
-          description: `${
-            type === "INCOME" ? "Received" : "Paid for"
-          } ${category}`,
-          date: date.toISOString(),
+          description: `${type === "INCOME" ? "Received" : "Paid for"
+            } ${category}`,
+          date,
           category,
           status: "COMPLETED",
           userId: USER_ID,
           accountId: ACCOUNT_ID,
-          createdAt: date.toISOString(),
-          updatedAt: date.toISOString(),
+          createdAt: date,
+          updatedAt: date,
         };
 
         totalBalance += type === "INCOME" ? amount : -amount;
@@ -81,24 +79,23 @@ export async function seedTransactions() {
     }
 
     // Insert transactions in batches and update account balance
-    const seedTransaction = db.transaction((txs) => {
+    await db.$transaction(async (tx) => {
       // Clear existing transactions
-      db.prepare('DELETE FROM transactions WHERE accountId = ?').run(ACCOUNT_ID);
+      await tx.transaction.deleteMany({
+        where: { accountId: ACCOUNT_ID },
+      });
 
       // Insert new transactions
-      const insert = db.prepare(`
-        INSERT INTO transactions (id, type, amount, description, date, category, status, userId, accountId, createdAt, updatedAt)
-        VALUES (@id, @type, @amount, @description, @date, @category, @status, @userId, @accountId, @createdAt, @updatedAt)
-      `);
-      for (const t of txs) {
-        insert.run(t);
-      }
+      await tx.transaction.createMany({
+        data: transactions,
+      });
 
       // Update account balance
-      db.prepare('UPDATE accounts SET balance = ? WHERE id = ?').run(totalBalance, ACCOUNT_ID);
+      await tx.account.update({
+        where: { id: ACCOUNT_ID },
+        data: { balance: totalBalance },
+      });
     });
-
-    seedTransaction(transactions);
 
     return {
       success: true,
